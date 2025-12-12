@@ -22,11 +22,12 @@ pub struct HeaderData {
 }
 
 
-pub fn parse(path: &Path) -> Result<HeaderData, Error>
+pub fn parse(path: &Path) -> Result<(), Error>
 {
     assert!(path.exists());
     let file = File::open(path)?;
-    parse_header(file)
+    let header_data = parse_header(file)?;
+    Ok(())
 }
 
 fn parse_header(file: File) -> Result<HeaderData, Error>
@@ -67,7 +68,10 @@ fn parse_header(file: File) -> Result<HeaderData, Error>
             }
     };
 
-    Ok(HeaderData { format, 
-        num_tracks: u16::from_be_bytes(data_buf[2..4].try_into().unwrap()), 
-        division: u16::from_be_bytes(data_buf[4..6].try_into().unwrap()) })
+    let num_tracks = u16::from_be_bytes(data_buf[2..4].try_into().unwrap());
+    let division = u16::from_be_bytes(data_buf[2..4].try_into().unwrap());
+    
+    // this is ugly looking, basically all we're saying here is the num_tracks is bytes 2 and 3 are the number of tracks
+    // and that the division (delta time unit) is bytes 4 and 5. 
+    Ok( HeaderData { format, num_tracks, division } )
 }
