@@ -1,6 +1,7 @@
 use std::path::Path;
 
 mod parse;
+mod bits;
 
 fn main() {
     println!("Hello, world!");

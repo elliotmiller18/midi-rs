@@ -1,13 +1,26 @@
 use std::io::{BufReader, Read, Error, ErrorKind};
 use std::path::Path;
 use std::fs::File;
+use crate::bits::{self, msb};
 
 // MIDI SPEC: https://ccrma.stanford.edu/~craig/14q/midifile/MidiFileFormat.html
 // or better: https://midimusic.github.io/tech/midispec.html
 const HEADER_MARKER: u32 = 0x4d546864;
 const TRACK_MARKER: u32 = 0x4d54726b;
 const EXPECTED_INFO_SIZE_BYTES: usize = 6;
+// midi event tags
+const NOTE_OFF_STATUS: u8 = 0b1000;
+const NOTE_ON_STATUS: u8 = 0b1001;
+// unused midi event tags we have for skipping bytes
+const POLY_KEY_PRESSURE_STATUS: u8 = 0b1010;
+const CONTROL_CHANGE_STATUS: u8 = 0b1011;
+const PROGRAM_CHANGE_STATUS: u8 = 0b1100;
+const CHANNEL_PRESSURE_STATUS: u8 = 0b1101;
+const PITCH_WHEEL_CHANGE_STATUS: u8 = 0b1110;
+const SYSTEM_MESSAGE_STATUS: u8 = 0b1111;
+const UNDEFINED_MARKER: u8 = 0b11110001;
 
+#[derive(PartialEq)]
 enum FileFormat {
     SingleTrack,
     MultipleTrack,
@@ -20,12 +33,22 @@ pub enum MetaEvent {
     SetTempo(u32)
 }
 
+pub enum MidiEvent {
+    Unimplemented,
+    NoteOn { note: u8, velocity: u8, channel: u8 } ,
+    NoteOff { note: u8, velocity: u8, channel: u8 } ,
+    //TODO: implement these, for now just note on and note off
+    // ProgramChange(u8),
+    // ControlChange(u8, u8),
+    // PitchBend(u16),
+}
+
 enum Event {
     //TODO: fill in
     //sysex events aren't useful to us for our toy synth so we just skip them, they're basically just noops
     Sysex,
     Meta(MetaEvent),
-    MIDI,
+    Midi(MidiEvent),
 }
 
 pub struct TrackChunk {
@@ -48,7 +71,7 @@ pub fn parse(path: &Path) -> Result<(), Error>
     let mut reader = BufReader::new(file);
 
     let header_data = parse_header(&mut reader)?;
-    parse_tracks(&mut reader);
+    parse_tracks(&mut reader)?;
 
     Ok(())
 }
@@ -117,11 +140,11 @@ fn parse_tracks(reader: &mut BufReader<File>) -> Result<Vec<TrackChunk>, Error> 
     let mut track_buf = vec![0u8; length];
     reader.read_exact(&mut track_buf)?;
     let mut cur: &[u8] = &track_buf;
+    let mut running_status: Option<u8> = None;
     while cur.len() > 0 {
         // this will advance the slice past the delta time
         let delta_time = extract_vlq(&mut cur)?;
-        let event = extract_event(&mut cur)?;
-        //TODO: grab events
+        let event = extract_event(&mut running_status, &mut cur)?;
     }
 
     //TODO: remove placeholder value
@@ -138,7 +161,7 @@ fn extract_vlq(bytes: &mut &[u8]) -> Result<u32, Error> {
         // shift variable_length 7 to the left and add the current byte without its msb to varible_length
         vlq = (vlq << 7) | u32::from(b & 0x7f);
         // the msb being a 0 indiciates that this is the final byte of data
-        if (b & 0x80) == 0 { break; }
+        if !bits::msb_set(b) { break; }
         // the file is claiming there's more data outside of the allowed 4 byte range
         else if i == 3 {
             return Err(Error::new(
@@ -162,11 +185,12 @@ fn extract_byte(bytes: &mut &[u8]) -> Result<u8, Error> {
     }
 }
 
-fn extract_event(bytes: &mut &[u8]) -> Result<Event, Error> {
+fn extract_event(running_status: &mut Option<u8>, bytes: &mut &[u8]) -> Result<Event, Error> {
     let first = extract_byte(bytes)?;
     
     match first {
         0xf0 | 0xf7 => {
+            *running_status = None;
             let len = extract_vlq(bytes)? as usize;
             if bytes.len() < len {
                 return Err(Error::new(
@@ -177,8 +201,11 @@ fn extract_event(bytes: &mut &[u8]) -> Result<Event, Error> {
             *bytes = &bytes[len..];
             Ok(Event::Sysex)
         },
-        0xff => extract_meta(bytes),
-        _ => extract_midi(bytes)
+        0xff => {
+            *running_status = None;
+            extract_meta(bytes)
+        },
+        _ => extract_midi(running_status, first, bytes)
     }
 }
 
@@ -193,9 +220,9 @@ fn extract_meta(bytes: &mut &[u8]) -> Result<Event, Error> {
         );
     }
 
-    // now we have to handle unimplemented events
     let meta_event = match event_type {
         0x2f => {
+            // end of track always has len 0 (it's the end of the track)
             if len != 0 {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -218,6 +245,7 @@ fn extract_meta(bytes: &mut &[u8]) -> Result<Event, Error> {
 
             MetaEvent::SetTempo(tempo)
         },
+        // these are all of the meta events i'm not implementing cause they're not that interesting or super niche
         0x01..=0x07 | 0x54 | 0x58 | 0x59 | 0x7f => MetaEvent::Unimplemented,
         _ => {
             return Err(Error::new(
@@ -230,8 +258,49 @@ fn extract_meta(bytes: &mut &[u8]) -> Result<Event, Error> {
     Ok(Event::Meta(meta_event))
 }
 
-fn extract_midi(bytes: &mut &[u8]) -> Result<Event, Error> {
-    todo!("implement");
+fn extract_midi(running_status: &mut Option<u8>, first_byte: u8, bytes: &mut &[u8]) -> Result<Event, Error> {
+    //TODO: FINISH RUNNING STATUS STUFF
+    // if the msb is set this is NOT a data byte
+    if bits::msb_set(first_byte) {
+        if (0x80..=0xEF).contains(&first_byte) {
+            *running_status = Some(first_byte);
+        } else {
+            // system messages (0xF0..0xFF) don't use running status
+            *running_status = None;
+        }
+    // TODO: I HAVEN'T STARTED WORKING ON RUNNING STATUS BELOW THIS LINE SO ASSUME EVERYTHING BELOW IS WRONG
+    } else {
+
+    }
+
+    match bits::msb(first_byte) {
+        NOTE_OFF_STATUS => Ok(Event::Midi(MidiEvent::NoteOff { note: extract_byte(bytes)?, velocity: extract_byte(bytes)?, channel: bits::lsb(first_byte) })),
+        NOTE_ON_STATUS => Ok(Event::Midi(MidiEvent::NoteOn { note: extract_byte(bytes)?, velocity: extract_byte(bytes)?, channel: bits::lsb(first_byte) })),
+        SYSTEM_MESSAGE_STATUS => {
+            // skipping bits as appropriate for each system message on the tiny off chance they pop up
+            match bits::lsb(first_byte) {
+                0b0000 => unreachable!("trying to handle sysex event tagged 0xF0 in extract_midi!"),
+                0b0010 => {
+                    // try and extract the next 2 bytes of unneeded system message data
+                    extract_byte(bytes)?;
+                    extract_byte(bytes)?;
+                }
+                0b0011 => { extract_byte(bytes)?; }
+                _ => {}
+            }
+            Ok(Event::Midi(MidiEvent::Unimplemented))
+        },
+        PROGRAM_CHANGE_STATUS | CHANNEL_PRESSURE_STATUS => {
+            extract_byte(bytes)?;
+            Ok(Event::Midi(MidiEvent::Unimplemented))
+        }
+        _ => {
+            // we do it twice for 2 bytes
+            extract_byte(bytes)?;
+            extract_byte(bytes)?;
+            Ok(Event::Midi(MidiEvent::Unimplemented))
+        }
+    }
 }
 
 
