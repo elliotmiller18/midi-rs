@@ -1,7 +1,7 @@
 use std::io::{BufReader, Read, Error, ErrorKind};
 use std::path::Path;
 use std::fs::File;
-use crate::bits::{self, msb};
+use crate::bits;
 
 // MIDI SPEC: https://ccrma.stanford.edu/~craig/14q/midifile/MidiFileFormat.html
 // or better: https://midimusic.github.io/tech/midispec.html
@@ -12,13 +12,12 @@ const EXPECTED_INFO_SIZE_BYTES: usize = 6;
 const NOTE_OFF_STATUS: u8 = 0b1000;
 const NOTE_ON_STATUS: u8 = 0b1001;
 // unused midi event tags we have for skipping bytes
-const POLY_KEY_PRESSURE_STATUS: u8 = 0b1010;
-const CONTROL_CHANGE_STATUS: u8 = 0b1011;
+// const POLY_KEY_PRESSURE_STATUS: u8 = 0b1010;
+// const CONTROL_CHANGE_STATUS: u8 = 0b1011;
 const PROGRAM_CHANGE_STATUS: u8 = 0b1100;
 const CHANNEL_PRESSURE_STATUS: u8 = 0b1101;
-const PITCH_WHEEL_CHANGE_STATUS: u8 = 0b1110;
+// const PITCH_WHEEL_CHANGE_STATUS: u8 = 0b1110;
 const SYSTEM_MESSAGE_STATUS: u8 = 0b1111;
-const UNDEFINED_MARKER: u8 = 0b11110001;
 
 #[derive(PartialEq)]
 enum FileFormat {
@@ -27,12 +26,14 @@ enum FileFormat {
     MultipleSong
 }
 
+#[derive(Debug)]
 pub enum MetaEvent {
     Unimplemented,
     EndOfTrack,
     SetTempo(u32)
 }
 
+#[derive(Debug)]
 pub enum MidiEvent {
     Unimplemented,
     NoteOn { note: u8, velocity: u8, channel: u8 } ,
@@ -43,16 +44,16 @@ pub enum MidiEvent {
     // PitchBend(u16),
 }
 
-enum Event {
-    //TODO: fill in
+#[derive(Debug)]
+enum EventType {
     //sysex events aren't useful to us for our toy synth so we just skip them, they're basically just noops
     Sysex,
     Meta(MetaEvent),
     Midi(MidiEvent),
 }
 
-pub struct TrackChunk {
-    event: Event,
+pub struct Event {
+    ty: EventType,
     delta_time: u32
 }
 
@@ -64,16 +65,13 @@ pub struct HeaderData {
 }
 
 
-pub fn parse(path: &Path) -> Result<(), Error>
+pub fn parse(path: &Path) -> Result<(HeaderData, Vec<Event>), Error>
 {
     assert!(path.exists());
     let file = File::open(path)?; 
     let mut reader = BufReader::new(file);
 
-    let header_data = parse_header(&mut reader)?;
-    parse_tracks(&mut reader)?;
-
-    Ok(())
+    Ok( (parse_header(&mut reader)?, parse_track(&mut reader)?) ) 
 }
 
 fn parse_header(reader: &mut BufReader<File>) -> Result<HeaderData, Error>
@@ -120,7 +118,7 @@ fn parse_header(reader: &mut BufReader<File>) -> Result<HeaderData, Error>
     Ok( HeaderData { format, num_tracks, division } )
 }
 
-fn parse_tracks(reader: &mut BufReader<File>) -> Result<Vec<TrackChunk>, Error> {
+fn parse_track(reader: &mut BufReader<File>) -> Result<Vec<Event>, Error> {
     let mut marker_buf = [0u8; 4];
     reader.read_exact(&mut marker_buf)?;
     
@@ -141,14 +139,15 @@ fn parse_tracks(reader: &mut BufReader<File>) -> Result<Vec<TrackChunk>, Error> 
     reader.read_exact(&mut track_buf)?;
     let mut cur: &[u8] = &track_buf;
     let mut running_status: Option<u8> = None;
+    let mut events: Vec<Event> = vec![];
     while cur.len() > 0 {
         // this will advance the slice past the delta time
         let delta_time = extract_vlq(&mut cur)?;
-        let event = extract_event(&mut running_status, &mut cur)?;
+        let ty = extract_event(&mut running_status, &mut cur)?;
+        events.push(Event {ty, delta_time});
     }
 
-    //TODO: remove placeholder value
-    Ok(vec![TrackChunk {event: Event::Sysex, delta_time: 0}])
+    Ok(events)
 }
 
 // midi files use this interesting (weird) encoding i haven't seen before, see this for more:
@@ -185,12 +184,11 @@ fn extract_byte(bytes: &mut &[u8]) -> Result<u8, Error> {
     }
 }
 
-fn extract_event(running_status: &mut Option<u8>, bytes: &mut &[u8]) -> Result<Event, Error> {
+fn extract_event(running_status: &mut Option<u8>, bytes: &mut &[u8]) -> Result<EventType, Error> {
     let first = extract_byte(bytes)?;
     
     match first {
         0xf0 | 0xf7 => {
-            *running_status = None;
             let len = extract_vlq(bytes)? as usize;
             if bytes.len() < len {
                 return Err(Error::new(
@@ -199,18 +197,15 @@ fn extract_event(running_status: &mut Option<u8>, bytes: &mut &[u8]) -> Result<E
                 );
             }
             *bytes = &bytes[len..];
-            Ok(Event::Sysex)
+            Ok(EventType::Sysex)
         },
-        0xff => {
-            *running_status = None;
-            extract_meta(bytes)
-        },
+        0xff => extract_meta(bytes),
         _ => extract_midi(running_status, first, bytes)
     }
 }
 
 
-fn extract_meta(bytes: &mut &[u8]) -> Result<Event, Error> {
+fn extract_meta(bytes: &mut &[u8]) -> Result<EventType, Error> {
     let event_type = extract_byte(bytes)?;
     let len = extract_vlq(bytes)? as usize;
     if bytes.len() < len {
@@ -255,50 +250,58 @@ fn extract_meta(bytes: &mut &[u8]) -> Result<Event, Error> {
     };
 
     *bytes = &bytes[len..];
-    Ok(Event::Meta(meta_event))
+    Ok(EventType::Meta(meta_event))
 }
 
-fn extract_midi(running_status: &mut Option<u8>, first_byte: u8, bytes: &mut &[u8]) -> Result<Event, Error> {
-    //TODO: FINISH RUNNING STATUS STUFF
-    // if the msb is set this is NOT a data byte
+// this func should only be called when we're at the start of a new event.
+// therefore, we can just have the status either be the old running status or the current status byte?
+fn extract_midi(running_status: &mut Option<u8>, first_byte: u8, bytes: &mut &[u8]) -> Result<EventType, Error> {
+    // if the msb is set, this is a status marker meaning we need to update running_status,
+    // if it is a data byte just check that there exists a running status! :D
+    let mut using_running_status = running_status.is_some();
     if bits::msb_set(first_byte) {
-        if (0x80..=0xEF).contains(&first_byte) {
-            *running_status = Some(first_byte);
-        } else {
-            // system messages (0xF0..0xFF) don't use running status
-            *running_status = None;
-        }
-    // TODO: I HAVEN'T STARTED WORKING ON RUNNING STATUS BELOW THIS LINE SO ASSUME EVERYTHING BELOW IS WRONG
-    } else {
-
+        *running_status = Some(first_byte);
+        using_running_status = false;
+    } else if *running_status == None {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "somehow running status is none but we're looking at a data byte for our first byte")
+        );
     }
 
-    match bits::msb(first_byte) {
-        NOTE_OFF_STATUS => Ok(Event::Midi(MidiEvent::NoteOff { note: extract_byte(bytes)?, velocity: extract_byte(bytes)?, channel: bits::lsb(first_byte) })),
-        NOTE_ON_STATUS => Ok(Event::Midi(MidiEvent::NoteOn { note: extract_byte(bytes)?, velocity: extract_byte(bytes)?, channel: bits::lsb(first_byte) })),
+    let status = running_status.ok_or_else(|| {
+            Error::new(ErrorKind::InvalidData, "data byte with no running status")
+    })?;
+
+    match bits::msb(status) {
+        NOTE_OFF_STATUS => Ok(EventType::Midi(MidiEvent::NoteOff { note: extract_byte(bytes)?, velocity: extract_byte(bytes)?, channel: bits::lsb(first_byte) })),
+        NOTE_ON_STATUS => Ok(EventType::Midi(MidiEvent::NoteOn { note: extract_byte(bytes)?, velocity: extract_byte(bytes)?, channel: bits::lsb(first_byte) })),
         SYSTEM_MESSAGE_STATUS => {
             // skipping bits as appropriate for each system message on the tiny off chance they pop up
-            match bits::lsb(first_byte) {
+            match bits::lsb(status) {
                 0b0000 => unreachable!("trying to handle sysex event tagged 0xF0 in extract_midi!"),
                 0b0010 => {
                     // try and extract the next 2 bytes of unneeded system message data
-                    extract_byte(bytes)?;
-                    extract_byte(bytes)?;
+                    extract_byte(bytes)?; extract_byte(bytes)?;
                 }
                 0b0011 => { extract_byte(bytes)?; }
                 _ => {}
             }
-            Ok(Event::Midi(MidiEvent::Unimplemented))
+            Ok(EventType::Midi(MidiEvent::Unimplemented))
         },
         PROGRAM_CHANGE_STATUS | CHANNEL_PRESSURE_STATUS => {
-            extract_byte(bytes)?;
-            Ok(Event::Midi(MidiEvent::Unimplemented))
+            // if we're not using running status, that means that the byte that was already extracted by the 
+            // extract_event func is a status byte. if we are using running status, then this data byte
+            // was already extracted by extract_event. same thing follows for the last arm below
+            if !using_running_status { extract_byte(bytes)?; }
+            // we've already consumed 
+            Ok(EventType::Midi(MidiEvent::Unimplemented))
         }
         _ => {
-            // we do it twice for 2 bytes
+            // see comment in above (PROGRAM_CHANGE_STATUS | CHANNEL_PRESSURE_STATUS) arm!
+            if !using_running_status { extract_byte(bytes)?; }
             extract_byte(bytes)?;
-            extract_byte(bytes)?;
-            Ok(Event::Midi(MidiEvent::Unimplemented))
+            Ok(EventType::Midi(MidiEvent::Unimplemented))
         }
     }
 }
