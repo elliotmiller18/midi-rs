@@ -1,7 +1,6 @@
 use std::io::{BufReader, Read, Error, ErrorKind};
 use std::path::Path;
 use std::fs::File;
-use crate::bits;
 
 // MIDI SPEC: https://ccrma.stanford.edu/~craig/14q/midifile/MidiFileFormat.html
 // or better: https://midimusic.github.io/tech/midispec.html
@@ -75,6 +74,17 @@ pub struct HeaderData {
     division: u16
 }
 
+fn upper_nibble(target: u8) -> u8 {
+    target >> 4
+}
+
+fn lower_nibble(target: u8) -> u8 {
+    target & 0b1111
+}
+
+fn msb_set(target: u8) -> bool {
+    (target >> 7) == 1
+}
 
 pub fn parse(path: &Path) -> Result<(HeaderData, Vec<Vec<Event>>), Error>
 {
@@ -180,7 +190,7 @@ fn extract_vlq(bytes: &mut &[u8]) -> Result<u32, Error> {
         // shift variable_length 7 to the left and add the current byte without its msb to varible_length
         vlq = (vlq << 7) | u32::from(b & 0x7f);
         // the msb being a 0 indiciates that this is the final byte of data
-        if !bits::msb_set(b) { break; }
+        if !msb_set(b) { break; }
         // the file is claiming there's more data outside of the allowed 4 byte range
         else if i == 3 {
             return Err(Error::new(
@@ -301,7 +311,7 @@ fn extract_midi(running_status: &mut Option<u8>, mut first_byte: u8, bytes: &mut
     // if the msb is set, this is a status marker meaning we need to update running_status,
     // if it is a data byte just check that there exists a running status! :D
     let mut using_running_status = running_status.is_some();
-    if bits::msb_set(first_byte) {
+    if msb_set(first_byte) {
         *running_status = Some(first_byte);
         using_running_status = false;
     } else if *running_status == None {
@@ -316,12 +326,12 @@ fn extract_midi(running_status: &mut Option<u8>, mut first_byte: u8, bytes: &mut
     })?;
 
     if !using_running_status { first_byte = extract_byte(bytes)?; }
-    match bits::msb(status) {
+    match upper_nibble(status) {
         NOTE_OFF_STATUS => Ok(EventType::Midi(MidiEvent::NoteOff 
-            { note: first_byte, velocity: extract_byte(bytes)?, channel: bits::lsb(status) }
+            { note: first_byte, velocity: extract_byte(bytes)?, channel: lower_nibble(status) }
         )),
         NOTE_ON_STATUS => Ok(EventType::Midi(MidiEvent::NoteOn 
-            { note: first_byte, velocity: extract_byte(bytes)?, channel: bits::lsb(status) }
+            { note: first_byte, velocity: extract_byte(bytes)?, channel: lower_nibble(status) }
         )),
         SYSTEM_MESSAGE_STATUS => { unreachable!("trying to handle system message in extract_midi") }
         PROGRAM_CHANGE_STATUS | CHANNEL_PRESSURE_STATUS => {
