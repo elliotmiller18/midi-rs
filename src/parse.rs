@@ -19,7 +19,16 @@ const CHANNEL_PRESSURE_STATUS: u8 = 0b1101;
 // const PITCH_WHEEL_CHANGE_STATUS: u8 = 0b1110;
 const SYSTEM_MESSAGE_STATUS: u8 = 0b1111;
 
-#[derive(PartialEq)]
+#[derive(Copy, Clone)]
+pub struct Hex8(pub u8);
+
+impl std::fmt::Debug for Hex8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{:02X}", self.0)
+    }
+}
+
+#[derive(PartialEq, Debug)]
 enum FileFormat {
     SingleTrack,
     MultipleTrack,
@@ -28,14 +37,14 @@ enum FileFormat {
 
 #[derive(Debug)]
 pub enum MetaEvent {
-    Unimplemented,
+    Unimplemented {status: Hex8},
     EndOfTrack,
     SetTempo(u32)
 }
 
 #[derive(Debug)]
 pub enum MidiEvent {
-    Unimplemented,
+    Unimplemented {status: Hex8},
     NoteOn { note: u8, velocity: u8, channel: u8 } ,
     NoteOff { note: u8, velocity: u8, channel: u8 } ,
     //TODO: implement these, for now just note on and note off
@@ -52,11 +61,13 @@ enum EventType {
     Midi(MidiEvent),
 }
 
+#[derive(Debug)]
 pub struct Event {
     ty: EventType,
     delta_time: u32
 }
 
+#[derive(Debug)]
 pub struct HeaderData {
     format: FileFormat,
     num_tracks: u16,
@@ -65,17 +76,26 @@ pub struct HeaderData {
 }
 
 
-pub fn parse(path: &Path) -> Result<(HeaderData, Vec<Event>), Error>
+pub fn parse(path: &Path) -> Result<(HeaderData, Vec<Vec<Event>>), Error>
 {
     assert!(path.exists());
     let file = File::open(path)?; 
     let mut reader = BufReader::new(file);
 
-    Ok( (parse_header(&mut reader)?, parse_track(&mut reader)?) ) 
+    let header = parse_header(&mut reader)?;
+    let mut tracks: Vec<Vec<Event>> = Vec::with_capacity(header.num_tracks as usize);
+    for i in 0..header.num_tracks {
+        let track = parse_track(&mut reader)?;
+        println!("track {}:\n{:#?}", i, track);
+        tracks.push(track);
+    }
+
+    Ok( (header, tracks ) )
 }
 
 fn parse_header(reader: &mut BufReader<File>) -> Result<HeaderData, Error>
-{   
+{      
+    // the chunk type is 4 bytes long
     let mut marker_buf = [0u8; 4];
     reader.read_exact(&mut marker_buf)?;
     
@@ -188,22 +208,44 @@ fn extract_event(running_status: &mut Option<u8>, bytes: &mut &[u8]) -> Result<E
     let first = extract_byte(bytes)?;
     
     match first {
-        0xf0 | 0xf7 => {
-            let len = extract_vlq(bytes)? as usize;
-            if bytes.len() < len {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "length vlq higher than actual bytes in sysex event!")
-                );
-            }
-            *bytes = &bytes[len..];
-            Ok(EventType::Sysex)
+        0xf0..=0xfe => {
+            *running_status = None;
+            extract_system(first, bytes)
         },
-        0xff => extract_meta(bytes),
+        0xff => {
+            *running_status = None;
+            extract_meta(bytes)
+        },
         _ => extract_midi(running_status, first, bytes)
     }
 }
 
+// this just skips over them and does nothing with the data
+fn extract_system(status: u8, bytes: &mut &[u8]) -> Result<EventType, Error> {
+    match status {
+        0xf0 | 0xf7 => {
+            // In a FILE, F0 and F7 are followed by a VLQ length
+            let len = extract_vlq(bytes)? as usize;
+            if bytes.len() < len {
+                return Err(Error::new(ErrorKind::InvalidData, "Sysex/Escape event truncated"));
+            }
+            // Skip the data bytes
+            *bytes = &bytes[len..];
+        },
+        0xf2 => {
+            // Song Position Pointer (2 bytes)
+            extract_byte(bytes)?; extract_byte(bytes)?;
+        },
+        0xf1 | 0xf3 => {
+            // Song Select (1 byte)
+            extract_byte(bytes)?;
+        },
+        _ => {
+            // F4, F5, F6 (Tune Request), and Real-time F8-FE have 0 data bytes
+        }
+    }
+    Ok(EventType::Sysex)
+}
 
 fn extract_meta(bytes: &mut &[u8]) -> Result<EventType, Error> {
     let event_type = extract_byte(bytes)?;
@@ -241,7 +283,7 @@ fn extract_meta(bytes: &mut &[u8]) -> Result<EventType, Error> {
             MetaEvent::SetTempo(tempo)
         },
         // these are all of the meta events i'm not implementing cause they're not that interesting or super niche
-        0x01..=0x07 | 0x54 | 0x58 | 0x59 | 0x7f => MetaEvent::Unimplemented,
+        0x01..=0x07 | 0x54 | 0x58 | 0x59 | 0x7f => MetaEvent::Unimplemented {status: Hex8(event_type) },
         _ => {
             return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -255,7 +297,7 @@ fn extract_meta(bytes: &mut &[u8]) -> Result<EventType, Error> {
 
 // this func should only be called when we're at the start of a new event.
 // therefore, we can just have the status either be the old running status or the current status byte?
-fn extract_midi(running_status: &mut Option<u8>, first_byte: u8, bytes: &mut &[u8]) -> Result<EventType, Error> {
+fn extract_midi(running_status: &mut Option<u8>, mut first_byte: u8, bytes: &mut &[u8]) -> Result<EventType, Error> {
     // if the msb is set, this is a status marker meaning we need to update running_status,
     // if it is a data byte just check that there exists a running status! :D
     let mut using_running_status = running_status.is_some();
@@ -273,35 +315,28 @@ fn extract_midi(running_status: &mut Option<u8>, first_byte: u8, bytes: &mut &[u
             Error::new(ErrorKind::InvalidData, "data byte with no running status")
     })?;
 
+    if !using_running_status { first_byte = extract_byte(bytes)?; }
     match bits::msb(status) {
-        NOTE_OFF_STATUS => Ok(EventType::Midi(MidiEvent::NoteOff { note: extract_byte(bytes)?, velocity: extract_byte(bytes)?, channel: bits::lsb(first_byte) })),
-        NOTE_ON_STATUS => Ok(EventType::Midi(MidiEvent::NoteOn { note: extract_byte(bytes)?, velocity: extract_byte(bytes)?, channel: bits::lsb(first_byte) })),
-        SYSTEM_MESSAGE_STATUS => {
-            // skipping bits as appropriate for each system message on the tiny off chance they pop up
-            match bits::lsb(status) {
-                0b0000 => unreachable!("trying to handle sysex event tagged 0xF0 in extract_midi!"),
-                0b0010 => {
-                    // try and extract the next 2 bytes of unneeded system message data
-                    extract_byte(bytes)?; extract_byte(bytes)?;
-                }
-                0b0011 => { extract_byte(bytes)?; }
-                _ => {}
-            }
-            Ok(EventType::Midi(MidiEvent::Unimplemented))
-        },
+        NOTE_OFF_STATUS => Ok(EventType::Midi(MidiEvent::NoteOff 
+            { note: first_byte, velocity: extract_byte(bytes)?, channel: bits::lsb(status) }
+        )),
+        NOTE_ON_STATUS => Ok(EventType::Midi(MidiEvent::NoteOn 
+            { note: first_byte, velocity: extract_byte(bytes)?, channel: bits::lsb(status) }
+        )),
+        SYSTEM_MESSAGE_STATUS => { unreachable!("trying to handle system message in extract_midi") }
         PROGRAM_CHANGE_STATUS | CHANNEL_PRESSURE_STATUS => {
             // if we're not using running status, that means that the byte that was already extracted by the 
             // extract_event func is a status byte. if we are using running status, then this data byte
             // was already extracted by extract_event. same thing follows for the last arm below
-            if !using_running_status { extract_byte(bytes)?; }
-            // we've already consumed 
-            Ok(EventType::Midi(MidiEvent::Unimplemented))
+
+            // (the behavior described above used to be here but was moved to the line before the match block)
+            Ok(EventType::Midi(MidiEvent::Unimplemented {status: Hex8(status)}))
         }
         _ => {
             // see comment in above (PROGRAM_CHANGE_STATUS | CHANNEL_PRESSURE_STATUS) arm!
-            if !using_running_status { extract_byte(bytes)?; }
+            // there are 2 bytes of data in all other events so we'll need to extract at least one always
             extract_byte(bytes)?;
-            Ok(EventType::Midi(MidiEvent::Unimplemented))
+            Ok(EventType::Midi(MidiEvent::Unimplemented {status: Hex8(status)}))
         }
     }
 }
